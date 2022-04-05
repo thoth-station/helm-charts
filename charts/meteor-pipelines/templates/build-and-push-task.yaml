@@ -1,0 +1,325 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: tag-release-pipeline
+  labels:
+    app: aicoe-ci
+spec:
+  description: >-
+    This task is meant to abstract how we build in our various applications. It should work with both S2I and buildah/docker.
+  params:
+    # general params
+    - name: log_level
+      description: log level when running S2I binary (S2I only).
+      default: "0"
+      type: string
+    - name: metrics
+      description: Boolean that dictates wether build metrics will be gathered and pushed.
+      type: string
+    # buildah params
+    - name: tls_verify
+      description: >-
+        Verify the TLS on the registry endpoint (for push/pull to a non-TLS
+        registry)
+      default: "true"
+      type: string
+    - name: storage_driver
+      description: "set buildah storage driver. Options: [vfs, overlay]."
+      default: vfs
+      type: string
+    # git information
+    - name: repo_name
+      description: The git repository title.
+      type: string
+    - name: git_ref
+      description: Git reference value.
+      type: string
+    # image information
+    - name: registry
+      description: "Container image registry. Options: [quay.io, docker]"
+      default: quay.io
+      type: string
+    - name: registry_secret
+      description: "Registry image push secret. Common value: thoth-station-thoth-pusher-secret"
+      default: ""
+      type: string
+    - name: registry_org
+      description: Name of the registry organization.
+      default: "thoth-staiton"
+      type: string
+    - name: registry_repo
+      description:
+      default: ""
+      type: string
+    - name: output_image
+      type: string
+      description: Reference of the image buildah will produce
+    - name: builder_image
+      description: The location of buildah builder image.
+      default: "quay.io/buildah/stable"
+      type: string
+    # build params
+    - name: build_extra_args
+      description: Extra parameters passed for the build command when building images.
+      default: ""
+      type: string
+    - name: format
+      description: "the format of the built container. Options: [oci, docker]."
+      default: oci
+      type: string
+    - name: build_strategy
+      description: The strategy to build the image from source. Options [dockerfile, containerfile, s2i]. Required.
+      type: string
+    # source params
+    - name: containerfile_path
+      description: Path to the directory where the dockerfile or containerfile. Please do not include the filename in this variable, it should only be the path to its directory.
+      default: ./
+      type: string
+    - name: context
+      description: Path to the directory to use as a context. Can be used for all options.
+      default: .
+      type: string
+    - name: build_source_script
+      description: Specify a URL for the assemble, assemble-runtime and run scripts
+      default: ""
+    # push args
+    - name: push_extra_args
+      description: Extra parameters passed for the push command when pushing images.
+      default: ""
+      type: string
+    - name: digest
+      description: Boolean that dictates wether to write the digest of the resulting image to the file after copying the image.
+      type: string
+    # s2i thoth params
+    - name: base_image
+      description: Base image to be used. Required for S2I build method.
+      default: "quay.io/thoth-station/s2i-thoth-ubi8-py36:latest"
+    - name: ENABLE_PIPENV
+      description: Set this variable to use Pipenv. Optional for S2I build.
+      default: "1"
+    - name: THOTH_ADVISE
+      description: Advise the recommended stack by Thoth.  Optional for S2I build.
+      default: "0"
+    - name: THOTH_ERROR_FALLBACK
+      description: Fallback to the lock file present in the repository if the submitted Thoth analysis fails.  Optional for S2I build.
+      default: "1"
+    - name: THOTH_DRY_RUN
+      description: Submit stack to Thoth, but do not use the recommended one.  Optional for S2I build.
+      default: "1"
+    - name: "THAMOS_DEBUG"
+      description: Thamos enable debug mode. Optional for S2I build.
+      default: "0"
+    - name: "THAMOS_VERBOSE"
+      description: Run thamos in verbose mode.  Optional for S2I build.
+      default: "1"
+    - name: THOTH_PROVENANCE_CHECK
+      description: Provenance check is verify the stack.  Optional for S2I build.
+      default: "0"
+    - name: THAMOS_NO_PROGRESSBAR
+      description: Disable progressbar for thamos.  Optional for S2I build.
+      default: "1"
+    ### Build strategy specific params
+    - name: layers
+      description: Pass the --layers flag to the buildah bud command. Used in Tag and Pr pipelines, not Meteor.
+      default: "true"
+      type: string
+    - name: no_cache
+      description: Pass the --no-cache flag to the buildah bud command. Used in the Meteor pipeline.
+      default: "false"
+      type: string
+  steps:
+    - name: build
+      image: $(params.builder_image)
+      workingDir: $(workspaces.data.path)
+      securityContext:
+        privileged: true
+      resources:
+        limits:
+          cpu: "2"
+          memory: "8Gi"
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+      script: |
+
+        # Top level params, same for all build strategies
+
+        if [[ "$(workspaces.sslcertdir.bound)" == "true" ]] &&  [[ "$(params.tls_verify)" == "true"]]; then
+          cert_dir_flag="--cert-dir $(workspaces.sslcertdir.path)"
+        fi
+
+        if [[ -n "$(params.output_image)" ]]; then # An output image to tag with is for everything except for the PR builds
+          image_tag="$(params.output_image)"
+          tag_image="-t ${image_tag}"
+        elif [[ $(params.repo_name) ]] && [[ $(params.git_ref) ]]; then
+          image_tag="$(params.repo_name)-$(params.git_ref)"
+          tag_image="-t ${image_tag}"
+        fi
+
+        if [[ -n "$(params.format)" ]]; then # Format is specific to meteor build pipeline, which only runs on dockerfile
+          format="--format=$(params.format)"
+        fi
+
+        if [[ "$(params.metrics)" == "true" ]]; then
+          mkdir -p .tekton_metrics
+          touch .tekton_metrics/images
+          start=`date +%s`
+        fi
+
+        if [[ -n "$(params.storage_driver)"]]; then
+          storage_driver="--storage-driver=$(params.storage_driver)"
+        fi
+
+        if [[ "$(params.layers)" == "true" ]]; then
+          layers="--layers"
+        fi
+
+        if [[ "$(params.no_cache)" == "true" ]]; then
+          no_cache="--no-cache"
+        fi
+
+
+        if [[ "$(params.build_strategy)" == "Containerfile" ]]; then
+          cp -rf . /gen-source/
+          if [[ -n "$(params.containerfile_path)" ]]; then
+            mv /gen-source/$(params.containerfile_path)/Containerfile /gen-source/Containerfile
+          fi
+        elif [[ "$(params.build_strategy)" == "Dockerfile" ]]; then
+          cp -rf . /gen-source/
+          mv /gen-source/$(params.containerfile_path)/Dockerfile /gen-source/Containerfile
+        elif [[ "$(params.build_strategy)" == "S2I" ]]; then
+          if [[ -n "$(params.build_source_script)" ]]; then
+            /usr/local/bin/s2i build \
+              $(params.context) \
+              $(params.base_image) \
+              --scripts-url=$(params.build_source_script) \
+              --assemble-user=root \
+              --assemble-runtime-user=root \
+              --loglevel=$(params.log_level) \
+              --env GIT_REPO_NAME=$(params.repo_name) \
+              --as-dockerfile /gen-source/Containerfile
+          else
+            /usr/local/bin/s2i build \
+              $(params.context) \
+              $(params.base_image) \
+              --env THAMOS_RUNTIME_ENVIRONMENT="" \
+              --env THOTH_ADVISE=$(params.THOTH_ADVISE) \
+              --env THOTH_ERROR_FALLBACK=$(params.THOTH_ERROR_FALLBACK) \
+              --env THOTH_DRY_RUN=$(params.THOTH_DRY_RUN) \
+              --env THAMOS_DEBUG=$(params.THAMOS_DEBUG) \
+              --env THAMOS_VERBOSE=$(params.THAMOS_VERBOSE) \
+              --env THOTH_PROVENANCE_CHECK=$(params.THOTH_PROVENANCE_CHECK) \
+              --env GIT_REPO_NAME=$(params.repo_name) \
+              --loglevel=$(params.log_level) \
+              --as-dockerfile /gen-source/Containerfile
+        fi
+
+        out=$(
+          buildah ${storage_driver} bud \
+            --tls-verify=$(params.tls_verify) \
+            -f /gen-source/Containerfile \
+            ${no_cache}
+            ${layers} \
+            ${tag_image}
+            ${cert_dir_flag} \
+            ${format} \
+            $(params.build_extra_args) \
+            $(params.context) 2>&1
+        )
+
+        exit_code=$?
+
+        echo $out > out
+        echo $exit_code > exit_code
+
+        if [[ "$(params.metrics)" == "true" ]]; then
+          end=`date +%s`
+          touch .tekton_metrics/image_build_success
+          echo "$((end-start))" > .tekton_metrics/image_build_duration
+        fi
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainer
+        - mountPath: /gen-source
+          name: gen-source
+
+    - name: push
+      image: $(params.builder_image)
+      workingDir: $(workspaces.data.path)
+      securityContext:
+        privileged: true
+      resources:
+        limits:
+          cpu: "2"
+          memory: "8Gi"
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+      script: |
+        if [[ "$(params.metrics)" == "true" ]]; then
+          start=`date +%s`
+        fi
+
+        if [[ "$(workspaces.sslcertdir.bound)" == "true" ]] &&  [[ "$(params.tls_verify)" == "true"]]; then
+          cert_dir_flag="--cert-dir $(workspaces.sslcertdir.path)"
+        fi
+
+        if [[ ! -z "$(params.format)" ]]; then
+          format="--format=$(params.format)"
+        fi
+
+        if [[ ! -z "$(params.output_image)" ]]; then
+          image_tag="$(params.output_image)"
+        elif [[ $(params.registry_org) ]] && [[ $(params.registry_repo) ]]; then
+          image_tag="$(params.registry_org)/$(params.registry_repo):$(params.git_ref)"
+        fi
+
+        registryImage="$(params.registry)://${image_tag}"
+
+        if [[ "$(params.digest)" == "true" ]]; then
+          digest="--digestfile $(workspaces.data.path/image-digest)
+        fi
+
+        if [[ ! -z "$(params.registry_secret)" ]]; then
+          authentication="--authfile=/pushsecret/.dockerconfigjson"
+        fi
+
+        if [[ -n "$(params.storage_driver)"]]; then
+          storage_driver="--storage-driver=$(params.storage_driver)"
+        fi
+
+        build ${storage_driver} push \
+          --tls-verify=$(params.tls_verify) \
+          ${authentication} \
+          ${cert_dir_flag} \
+          ${digest} \
+          $(params.push_extra_args) \
+          $(params.registry)://${image_tag}
+
+        if [[ "$(params.metrics)" == "true" ]]; then
+          end=`date +%s`
+          touch .tekton_metrics/image_push_success_total
+          echo "$((end-start))" > .tekton_metrics/image_push_duration
+        fi
+      volumeMounts:
+        - name: varlibcontainers
+          mountPath: /var/lib/containers
+        - name: quay-creds
+          mountPath: /pushsecret/
+          readOnly: true
+
+  volumes:
+    - name: varlibcontainers
+      emptyDir: {}
+    - name: gen-source
+      emptyDir: {}
+    - name: quay-creds
+      secret:
+        secretName: $(params.registry_secret)
+
+  workspaces:
+    - name: data
+    # this we will evaluate based on tesitng of enabling tls-verify PR(https://github.com/thoth-station/helm-charts/pull/32)
+    - name: sslcertdir
+      optional: true
+      mountPath: /workspace/sslcertdir
